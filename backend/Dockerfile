@@ -18,5 +18,8 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('tiny', dev
 # Copy application code
 COPY . .
 
-# Railway injects PORT env var
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Expose default port
+EXPOSE 8000
+
+# Railway injects PORT env var — shell form needed for $PORT substitution
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
