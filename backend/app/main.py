@@ -1,15 +1,26 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
 import time
 import logging
 
 from app.models import (
     HealthResponse,
-    WordResult,
     AnalysisResponse,
     ErrorResponse,
 )
+from app.config import settings
+from app.middleware.rate_limiter import limiter, rate_limit_handler
+from app.services.audio_validator import validate_audio, AudioValidationError
+from app.services.transcription import (
+    transcribe_audio,
+    check_transcription_quality,
+    get_quality_warnings,
+    TranscriptionError,
+)
+from app.services.phoneme_analyzer import get_phonemes_for_words
+from app.services.scorer import build_word_results, calculate_score
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -21,26 +32,24 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="Pronunciation Scoring API",
     description="Scores English pronunciation from free-form speech audio.",
-    version="0.1.0",
+    version="0.2.0",
 )
 
-# CORS — allow the Vercel frontend (and localhost for dev)
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    # Vercel preview/production URLs added here or via env var later
-]
+# Rate limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Phase 1: permissive; will lock down in production
+    allow_origins=["*"],  # Will lock down to Vercel domain in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
-# Global exception handler — never leak stack traces
+# Global exception handlers — never leak stack traces
 # ---------------------------------------------------------------------------
 
 @app.exception_handler(Exception)
@@ -76,85 +85,101 @@ async def health_check():
     return HealthResponse(
         status="ok",
         timestamp=time.time(),
-        version="0.1.0",
+        version="0.2.0",
     )
 
 
 @app.post("/api/v1/analyze", response_model=AnalysisResponse)
-async def analyze_audio(file: UploadFile = File(...)):
+@limiter.limit(settings.RATE_LIMIT)
+async def analyze_audio(request: Request, file: UploadFile = File(...)):
     """
-    Phase 1 STUB — accepts an audio file upload and returns dummy data.
-    Verifies the full upload round-trip works before real logic is added.
+    Full pronunciation analysis pipeline:
+    1. Validate audio (MIME, decode, duration, size)
+    2. Transcribe with Whisper (word timestamps + confidence)
+    3. Check transcription quality (language, silence, noise)
+    4. G2P phoneme conversion
+    5. Score and classify errors
+    6. Return results — then discard all audio data
     """
-    # Read the file to confirm upload actually works
-    contents = await file.read()
-    file_size_kb = len(contents) / 1024
+    contents = None
+    try:
+        # ---- Read file ----
+        contents = await file.read()
 
-    logger.info(
-        f"Received file: {file.filename}, "
-        f"content_type={file.content_type}, "
-        f"size={file_size_kb:.1f}KB"
-    )
+        logger.info(
+            f"Received file: {file.filename}, "
+            f"content_type={file.content_type}, "
+            f"size={len(contents) / 1024:.1f}KB"
+        )
 
-    # Explicit cleanup — audio never persists beyond request
-    del contents
+        # ---- 1. Validate audio ----
+        try:
+            audio_segment = validate_audio(contents, file.filename or "unknown")
+        except AudioValidationError as e:
+            return JSONResponse(
+                status_code=422,
+                content=ErrorResponse(
+                    error="validation_error",
+                    message=str(e),
+                ).model_dump(),
+            )
 
-    # Return stub response
-    return AnalysisResponse(
-        score=82.5,
-        words=[
-            WordResult(
-                word="Hello",
-                start=0.00,
-                end=0.42,
-                confidence=0.96,
-                phonemes="HH AH0 L OW1",
-            ),
-            WordResult(
-                word="my",
-                start=0.44,
-                end=0.58,
-                confidence=0.91,
-                phonemes="M AY1",
-            ),
-            WordResult(
-                word="name",
-                start=0.60,
-                end=0.88,
-                confidence=0.88,
-                phonemes="N EY1 M",
-            ),
-            WordResult(
-                word="is",
-                start=0.90,
-                end=1.02,
-                confidence=0.94,
-                phonemes="IH1 Z",
-            ),
-            WordResult(
-                word="pronunciation",
-                start=1.10,
-                end=1.85,
-                confidence=0.63,
-                error_type="unclear",
-                phonemes="P R AH0 N AH2 N S IY0 EY1 SH AH0 N",
-            ),
-            WordResult(
-                word="scoring",
-                start=1.90,
-                end=2.30,
-                confidence=0.45,
-                error_type="mispronunciation",
-                phonemes="S K AO1 R IH0 NG",
-            ),
-        ],
-        feedback=(
-            "This is a stub response for Phase 1 deployment verification. "
-            "Real pronunciation analysis will be available in Phase 2. "
-            "The word 'pronunciation' was flagged as unclear, and 'scoring' "
-            "was flagged as a potential mispronunciation."
-        ),
-        warnings=[],
-        transcript="Hello my name is pronunciation scoring",
-        language="en",
-    )
+        # Audio bytes no longer needed — free memory
+        del contents
+        contents = None
+
+        # ---- 2. Transcribe ----
+        try:
+            transcription = transcribe_audio(audio_segment)
+        except TranscriptionError as e:
+            return JSONResponse(
+                status_code=422,
+                content=ErrorResponse(
+                    error="transcription_error",
+                    message=str(e),
+                ).model_dump(),
+            )
+
+        # AudioSegment no longer needed
+        del audio_segment
+
+        # ---- 3. Quality checks ----
+        quality_issue = check_transcription_quality(transcription)
+        if quality_issue:
+            return JSONResponse(
+                status_code=422,
+                content=ErrorResponse(
+                    error="quality_error",
+                    message=quality_issue,
+                ).model_dump(),
+            )
+
+        warnings = get_quality_warnings(transcription)
+
+        # ---- 4. G2P phonemes ----
+        phoneme_map = get_phonemes_for_words(transcription.words)
+
+        # ---- 5. Score ----
+        word_results = build_word_results(transcription.words, phoneme_map)
+        score, feedback = calculate_score(
+            transcription.words,
+            transcription.duration,
+        )
+
+        # ---- 6. Return results ----
+        return AnalysisResponse(
+            score=score,
+            words=word_results,
+            feedback=feedback,
+            warnings=warnings,
+            transcript=transcription.full_text,
+            language=transcription.language,
+        )
+
+    except Exception:
+        # Global handler will catch this, but explicit cleanup first
+        raise
+    finally:
+        # Ensure audio is always discarded — DPDP compliance
+        if contents is not None:
+            del contents
