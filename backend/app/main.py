@@ -21,6 +21,7 @@ from app.services.transcription import (
 )
 from app.services.phoneme_analyzer import get_phonemes_for_words
 from app.services.scorer import build_word_results, calculate_score
+from app.services.llm_analyzer import analyze_with_llm, apply_llm_classifications
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -32,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(
     title="Pronunciation Scoring API",
     description="Scores English pronunciation from free-form speech audio.",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # Rate limiter
@@ -85,7 +86,7 @@ async def health_check():
     return HealthResponse(
         status="ok",
         timestamp=time.time(),
-        version="0.2.0",
+        version="0.3.0",
     )
 
 
@@ -98,8 +99,9 @@ async def analyze_audio(request: Request, file: UploadFile = File(...)):
     2. Transcribe with Whisper (word timestamps + confidence)
     3. Check transcription quality (language, silence, noise)
     4. G2P phoneme conversion
-    5. Score and classify errors
-    6. Return results — then discard all audio data
+    5. LLM error classification + feedback (Gemini Flash)
+    6. Score and classify errors (LLM-enhanced or heuristic fallback)
+    7. Return results — then discard all audio data
     """
     contents = None
     try:
@@ -159,14 +161,37 @@ async def analyze_audio(request: Request, file: UploadFile = File(...)):
         # ---- 4. G2P phonemes ----
         phoneme_map = get_phonemes_for_words(transcription.words)
 
-        # ---- 5. Score ----
-        word_results = build_word_results(transcription.words, phoneme_map)
-        score, feedback = calculate_score(
+        # ---- 5. LLM analysis (optional — graceful fallback) ----
+        llm_word_errors = None
+        llm_feedback = None
+
+        llm_result = analyze_with_llm(
+            transcription.words,
+            transcription.full_text,
+            phoneme_map,
+        )
+
+        if llm_result:
+            llm_word_errors, llm_feedback, _ = apply_llm_classifications(
+                transcription.words, llm_result
+            )
+            logger.info("Using LLM-enhanced classifications")
+        else:
+            logger.info("Using heuristic classifications (LLM unavailable)")
+
+        # ---- 6. Score ----
+        word_results = build_word_results(
+            transcription.words, phoneme_map, llm_word_errors
+        )
+        score, heuristic_feedback = calculate_score(
             transcription.words,
             transcription.duration,
         )
 
-        # ---- 6. Return results ----
+        # Use LLM feedback if available, otherwise heuristic
+        feedback = llm_feedback if llm_feedback else heuristic_feedback
+
+        # ---- 7. Return results ----
         return AnalysisResponse(
             score=score,
             words=word_results,

@@ -30,16 +30,28 @@ def classify_word_error(word: WordInfo) -> Optional[str]:
 def build_word_results(
     words: List[WordInfo],
     phoneme_map: Dict[str, str],
+    llm_word_errors: Optional[Dict[str, Dict]] = None,
 ) -> List[WordResult]:
     """
     Build the final word results list with error classifications and phonemes.
+    Uses LLM classifications when available, falls back to heuristics.
     """
     results = []
 
     for w in words:
         cleaned = re.sub(r"[^\w']", "", w.word).strip().lower()
-        error_type = classify_word_error(w)
         phonemes = phoneme_map.get(cleaned)
+
+        # Try LLM classification first, then fall back to heuristic
+        error_type = None
+        if llm_word_errors:
+            key = f"{w.word.strip()}@{w.start:.2f}"
+            llm_entry = llm_word_errors.get(key)
+            if llm_entry and isinstance(llm_entry, dict):
+                error_type = llm_entry.get("error_type")
+
+        if error_type is None:
+            error_type = classify_word_error(w)
 
         results.append(WordResult(
             word=w.word,
@@ -48,6 +60,7 @@ def build_word_results(
             confidence=round(w.probability, 4),
             error_type=error_type,
             phonemes=phonemes,
+
         ))
 
     return results
